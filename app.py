@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sqlite3
 import threading
@@ -11,6 +10,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+import revision_rules
+from version_archive import VersionArchive
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
@@ -66,6 +68,8 @@ class ReviewStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     version INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    abstract TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE (paper_id, version)
@@ -107,11 +111,29 @@ class ReviewStore:
                 );
                 CREATE TABLE IF NOT EXISTS decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
                     decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
                     note TEXT NOT NULL DEFAULT '',
                     decided_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    author_id TEXT NOT NULL REFERENCES users(id),
+                    version INTEGER NOT NULL,
+                    response TEXT NOT NULL,
+                    deadline TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS revision_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    revision_id INTEGER NOT NULL REFERENCES revisions(id),
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+                    review_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (revision_id, reviewer_id)
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,7 +185,6 @@ class ReviewStore:
         title, abstract = title.strip(), abstract.strip()
         if len(title) < 3 or len(abstract) < 20:
             raise BusinessError("标题至少 3 字，摘要至少 20 字", 422, "invalid_paper")
-        digest = hashlib.sha256(f"{title}\n{abstract}".encode()).hexdigest()
         with self.connect() as conn:
             user = self._user(conn, user_id)
             self._require(user, "author")
@@ -172,12 +193,9 @@ class ReviewStore:
                 (user_id, title, abstract, utcnow()),
             )
             paper_id = cur.lastrowid
-            conn.execute(
-                "INSERT INTO paper_versions(paper_id,version,content_hash,created_at) VALUES(?,?,?,?)",
-                (paper_id, 1, digest, utcnow()),
-            )
-            self._audit(conn, paper_id, user_id, "paper.submit", {"version": 1, "sha256": digest})
-            return {"id": paper_id, "status": "submitted", "version": 1, "sha256": digest}
+            snap = VersionArchive.snapshot(conn, paper_id, title, abstract)
+            self._audit(conn, paper_id, user_id, "paper.submit", {"version": snap["version"], "sha256": snap["sha256"]})
+            return {"id": paper_id, "status": "submitted", "version": snap["version"], "sha256": snap["sha256"]}
 
     def _paper_view(self, conn: sqlite3.Connection, paper: sqlite3.Row, viewer: sqlite3.Row) -> dict:
         data = {
@@ -356,6 +374,79 @@ class ReviewStore:
             self._audit(conn, paper_id, author_id, "rebuttal.submit", {"rebuttal_id": cur.lastrowid})
             return {"id": cur.lastrowid, "paper_id": paper_id, "content": content.strip()}
 
+    def submit_revision(self, author_id: str, paper_id: int, title: str, abstract: str, response: str) -> dict:
+        """大修/小修决定后，作者在窗口期内提交修订稿与逐条回复；论文回到评审中。"""
+        title, abstract, response = title.strip(), abstract.strip(), response.strip()
+        if len(title) < 3 or len(abstract) < 20:
+            raise BusinessError("标题至少 3 字，摘要至少 20 字", 422, "invalid_paper")
+        if len(response) < revision_rules.MIN_RESPONSE_LENGTH:
+            raise BusinessError(f"逐条回复至少 {revision_rules.MIN_RESPONSE_LENGTH} 字", 422, "response_too_short")
+        with self.connect() as conn:
+            author = self._user(conn, author_id)
+            self._require(author, "author")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper or paper["author_id"] != author_id:
+                    raise BusinessError("论文不存在或不属于当前作者", 404, "not_found")
+                if conn.execute("SELECT 1 FROM revisions WHERE paper_id=?", (paper_id,)).fetchone():
+                    raise BusinessError("已提交过修订稿，不能重复提交", 409, "revision_exists")
+                decision = conn.execute(
+                    "SELECT * FROM decisions WHERE paper_id=? ORDER BY id DESC LIMIT 1", (paper_id,)
+                ).fetchone()
+                if paper["status"] != "decided" or not decision or decision["decision"] not in revision_rules.REVISABLE_DECISIONS:
+                    raise BusinessError("仅大修/小修决定后才能提交修订稿", 409, "revision_not_allowed")
+                if revision_rules.is_overdue(decision["created_at"]):
+                    raise BusinessError("已超过返修提交期限", 409, "revision_overdue")
+                snap = VersionArchive.snapshot(conn, paper_id, title, abstract)
+                deadline = revision_rules.deadline_for(decision["created_at"]).isoformat(timespec="seconds")
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO revisions(paper_id,author_id,version,response,deadline,created_at) VALUES(?,?,?,?,?,?)",
+                        (paper_id, author_id, snap["version"], response, deadline, utcnow()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("已提交过修订稿，不能重复提交", 409, "revision_exists")
+                conn.execute("UPDATE papers SET title=?,abstract=?,status='under_review' WHERE id=?", (title, abstract, paper_id))
+                self._audit(conn, paper_id, author_id, "revision.submit", {"revision_id": cur.lastrowid, "version": snap["version"], "deadline": deadline})
+                return {"id": cur.lastrowid, "paper_id": paper_id, "version": snap["version"], "status": "under_review", "deadline": deadline}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def submit_revision_review(self, reviewer_id: str, paper_id: int, score: int, text: str) -> dict:
+        """原评审人针对修订版提交一份新意见；原有意见仅留档，不参与改判。"""
+        if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
+            raise BusinessError("评分必须是 1 到 5 的整数", 422, "invalid_score")
+        if len(text.strip()) < 10:
+            raise BusinessError("评审意见至少 10 字", 422, "review_too_short")
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id)
+            self._require(reviewer, "reviewer")
+            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
+                raise BusinessError("论文不存在", 404, "not_found")
+            revision = conn.execute("SELECT * FROM revisions WHERE paper_id=?", (paper_id,)).fetchone()
+            if not revision or paper["status"] != "under_review":
+                raise BusinessError("该论文当前不在返修评审阶段", 409, "revision_not_open")
+            if not conn.execute(
+                "SELECT 1 FROM assignments WHERE paper_id=? AND reviewer_id=? AND status='completed'",
+                (paper_id, reviewer_id),
+            ).fetchone():
+                raise BusinessError("只有原评审人可以提交新版意见", 403, "not_original_reviewer")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO revision_reviews(revision_id,reviewer_id,score,review_text,created_at) VALUES(?,?,?,?,?)",
+                    (revision["id"], reviewer_id, score, text.strip(), utcnow()),
+                )
+            except sqlite3.IntegrityError:
+                raise BusinessError("已提交过针对新版的意见", 409, "revision_review_exists")
+            self._audit(conn, paper_id, reviewer_id, "revision_review.submit", {"revision_id": revision["id"], "score": score})
+            required = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+            completed = conn.execute("SELECT COUNT(*) FROM revision_reviews WHERE revision_id=?", (revision["id"],)).fetchone()[0]
+            return {"id": cur.lastrowid, "revision_id": revision["id"], "paper_id": paper_id, "reviewer_id": reviewer_id,
+                    "score": score, "completed": completed, "required": required}
+
     def decide(self, chair_id: str, paper_id: int, decision: str, note: str = "") -> dict:
         if decision not in VALID_DECISIONS:
             raise BusinessError("决定值不合法", 422, "invalid_decision")
@@ -367,15 +458,26 @@ class ReviewStore:
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
                 if not paper or paper["status"] not in {"submitted", "under_review"}:
                     raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
-                if completed < 2:
-                    raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                revision = conn.execute("SELECT * FROM revisions WHERE paper_id=?", (paper_id,)).fetchone()
+                detail = {"decision": decision, "note": note.strip()}
+                if revision:
+                    # 返修轮：原有意见仅留档，所有原评审人提交新版意见后才能改判。
+                    expected = {r["reviewer_id"] for r in conn.execute("SELECT reviewer_id FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,))}
+                    done = {r["reviewer_id"] for r in conn.execute("SELECT reviewer_id FROM revision_reviews WHERE revision_id=?", (revision["id"],))}
+                    missing = sorted(expected - done)
+                    if missing:
+                        raise BusinessError("仍有原评审人未提交新版意见: " + ", ".join(missing), 409, "revision_reviews_incomplete")
+                    detail["revision_id"] = revision["id"]
+                else:
+                    completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+                    if completed < 2:
+                        raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
                 cur = conn.execute(
                     "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
                     (paper_id, decision, note.strip(), chair_id, utcnow()),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
-                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
+                self._audit(conn, paper_id, chair_id, "decision.record", detail)
                 return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
             except Exception:
                 conn.rollback()
@@ -386,6 +488,42 @@ class ReviewStore:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM audit_log WHERE paper_id=? ORDER BY id", (paper_id,)).fetchall()
             return [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
+
+    def get_revision(self, user_id: str, paper_id: int) -> dict:
+        """返修状态：修订稿、截止时间与新版意见进度。非主席看到的评审人匿名。"""
+        self.get_paper(user_id, paper_id)  # 权限检查。
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
+            revision = conn.execute("SELECT * FROM revisions WHERE paper_id=?", (paper_id,)).fetchone()
+            required = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+            revision_data = dict(revision) if revision else None
+            if revision_data and user["role"] == "reviewer":
+                revision_data.pop("author_id", None)  # 双盲：评审人看不到作者身份。
+            reviews = []
+            if revision:
+                rows = conn.execute(
+                    "SELECT reviewer_id,score,review_text,created_at FROM revision_reviews WHERE revision_id=? ORDER BY id",
+                    (revision["id"],),
+                ).fetchall()
+                for idx, row in enumerate(rows, 1):
+                    item = {"score": row["score"], "review_text": row["review_text"], "created_at": row["created_at"]}
+                    item["reviewer_id"] = row["reviewer_id"] if user["role"] == "chair" else f"reviewer#{idx}"
+                    reviews.append(item)
+            return {
+                "paper_id": paper_id,
+                "status": paper["status"],
+                "revision": revision_data,
+                "required": required,
+                "completed": len(reviews),
+                "reviews": reviews,
+            }
+
+    def list_versions(self, user_id: str, paper_id: int) -> list[dict]:
+        """版本存档：新旧版本均可查。"""
+        self.get_paper(user_id, paper_id)  # 权限检查。
+        with self.connect() as conn:
+            return VersionArchive.list_versions(conn, paper_id)
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -414,17 +552,21 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _user_id(self) -> str:
         return self.headers.get("X-User-Id", "")
 
+    def _serve_html(self, name: str) -> None:
+        html = (BASE_DIR / "web" / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.end_headers()
+        self.wfile.write(html)
+
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         if method == "GET" and path == "/":
-            html = (BASE_DIR / "web" / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.end_headers()
-            self.wfile.write(html)
-            return
+            return self._serve_html("index.html")
+        if method == "GET" and path == "/author":
+            return self._serve_html("author.html")
         if method == "GET" and path == "/health":
             return self._send(200, {"ok": True})
         store = self._store()
@@ -455,6 +597,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "revision" and method == "POST":
+                data = self._body()
+                return self._send(201, store.submit_revision(self._user_id(), paper_id, data.get("title", ""), data.get("abstract", ""), data.get("response", "")))
+            if len(parts) == 4 and parts[3] == "revision" and method == "GET":
+                return self._send(200, store.get_revision(self._user_id(), paper_id))
+            if len(parts) == 4 and parts[3] == "revision-reviews" and method == "POST":
+                data = self._body()
+                return self._send(201, store.submit_revision_review(self._user_id(), paper_id, data.get("score"), data.get("text", "")))
+            if len(parts) == 4 and parts[3] == "versions" and method == "GET":
+                return self._send(200, {"items": store.list_versions(self._user_id(), paper_id)})
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>作者中心 · 返修交付</title>
+<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style></head>
+<body><h1>作者中心 · 返修交付</h1>
+<p>大修/小修决定后 7 天内，在此提交修订稿与逐条回复；提交后论文回到评审中，旧版本在版本存档中永久可查。<a href="/">返回评审首页</a></p>
+<section class="panel"><h2>我的论文与版本存档</h2>
+<select id="user"><option>alice</option><option>bob</option></select>
+<button onclick="loadPapers()">加载我的论文</button>
+<input id="pid" placeholder="论文 ID" style="width:8em">
+<button onclick="loadVersions()">查看版本存档</button>
+<button onclick="loadRevision()">查看返修状态</button>
+<pre id="out"></pre></section>
+<section class="panel"><h2>提交修订稿</h2>
+<input id="title" placeholder="新标题"><textarea id="abstract" placeholder="新摘要（至少20字）"></textarea>
+<textarea id="response" placeholder="逐条回复：针对每条评审意见逐条回应（至少10字）"></textarea>
+<button onclick="submitRevision()">提交修订稿</button><pre id="rev"></pre></section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
+document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+const $=id=>document.getElementById(id);
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return await r.json()}
+function show(el,data){el.textContent=JSON.stringify(data,null,2)}
+async function loadPapers(){show($("out"),await api("/api/papers"))}
+async function loadVersions(){show($("out"),await api(`/api/papers/${$("pid").value}/versions`))}
+async function loadRevision(){show($("out"),await api(`/api/papers/${$("pid").value}/revision`))}
+async function submitRevision(){
+  const body={title:$("title").value,abstract:$("abstract").value,response:$("response").value};
+  show($("rev"),await api(`/api/papers/${$("pid").value}/revision`,{method:"POST",body:JSON.stringify(body)}));
+}
+</script></body></html>
