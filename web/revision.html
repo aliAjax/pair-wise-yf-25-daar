@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>返修交付</title>
+<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}.note{color:#666;font-size:14px}</style></head>
+<body><h1>返修交付</h1>
+<p class="note">大修/小修决定发出后 7 天内提交，修订稿与逐条回复缺一不可；每篇论文只能返修一次，旧版本继续可查。
+规则在 <code>revision_rules.py</code>、版本存档在 <code>version_archive.py</code>、本页面独立维护。<a href="/">返回主页面</a></p>
+<section class="panel">
+  <label>身份：<select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select></label>
+  <label>论文 ID：<input id="paperId" placeholder="例如 1"></label>
+  <button onclick="loadStatus()">查看返修状态</button>
+  <button onclick="loadVersions()">查看版本存档</button>
+</section>
+<div class="grid">
+<section class="panel"><h2>提交修订稿与逐条回复</h2>
+  <input id="title" placeholder="新版标题（至少3字）">
+  <textarea id="abstract" placeholder="新版摘要（至少20字）"></textarea>
+  <textarea id="response" placeholder="逐条回复（至少10字）"></textarea>
+  <button onclick="submitRevision()">提交返修稿</button>
+</section>
+<section class="panel"><h2>状态 / 版本</h2><pre id="output">先查看返修状态。</pre></section>
+</div>
+<section class="panel"><h2>原评审人复审与主席改判</h2>
+  <input id="score" type="number" min="1" max="5" placeholder="复审评分 1-5">
+  <textarea id="reviewText" placeholder="针对新版的复审意见（至少10字）"></textarea>
+  <button onclick="submitRevisionReview()">提交新版意见（原评审人）</button>
+  <hr>
+  <select id="decision"><option value="accept">accept</option><option value="reject">reject</option><option value="minor_revision">minor_revision</option><option value="major_revision">major_revision</option></select>
+  <input id="decisionNote" placeholder="改判说明（可选）">
+  <button onclick="redecide()">主席改判</button>
+</section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
+document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+function pid(){return parseInt(document.querySelector("#paperId").value,10)}
+async function api(url,opt={}){
+  const r=await fetch(url,{...opt,headers});
+  return {status:r.status,body:await r.json()};
+}
+function show(res){output.textContent=`HTTP ${res.status}\n`+JSON.stringify(res.body,null,2)}
+async function loadStatus(){show(await api(`/api/papers/${pid()}/revision`))}
+async function loadVersions(){show(await api(`/api/papers/${pid()}/versions`))}
+async function submitRevision(){
+  show(await api(`/api/papers/${pid()}/revision`,{method:"POST",body:JSON.stringify({
+    title:title.value,abstract:abstract.value,response:response.value})}));
+}
+async function submitRevisionReview(){
+  show(await api(`/api/papers/${pid()}/revision-reviews`,{method:"POST",body:JSON.stringify({
+    score:parseInt(score.value,10),text:reviewText.value})}));
+}
+async function redecide(){
+  show(await api(`/api/papers/${pid()}/redecide`,{method:"POST",body:JSON.stringify({
+    decision:decision.value,note:decisionNote.value})}));
+}
+</script></body></html>

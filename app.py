@@ -1,8 +1,14 @@
 """学术会议同行评审系统：标准库 + SQLite 的可运行示例。"""
 from __future__ import annotations
 
+import sys
+
+# 以 `python app.py` 启动时本模块名为 __main__，而关注点模块按
+# `from app import ...` 引用它；提前登记别名，避免二次加载造成循环导入。
+if __name__ == "__main__" and "app" not in sys.modules:
+    sys.modules["app"] = sys.modules[__name__]
+
 import argparse
-import hashlib
 import json
 import sqlite3
 import threading
@@ -29,11 +35,24 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class ReviewStore:
-    """领域逻辑。每个公开方法使用独立连接，避免 HTTP 线程共享 SQLite 连接。"""
+# 基础名字（BusinessError/utcnow）就绪后再导入关注点模块，避免循环导入。
+import revision_rules  # noqa: E402
+import version_archive  # noqa: E402
+from revision_rules import RevisionRulesMixin  # noqa: E402
+from version_archive import VersionArchiveMixin  # noqa: E402
 
-    def __init__(self, db_path: str | Path = DEFAULT_DB):
+
+class ReviewStore(RevisionRulesMixin, VersionArchiveMixin):
+    """领域逻辑。每个公开方法使用独立连接，避免 HTTP 线程共享 SQLite 连接。
+
+    返修流程见 revision_rules，版本存档见 version_archive；二者与本类分开维护，
+    通过 Mixin 组合。
+    """
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB, clock=utcnow):
         self.db_path = str(db_path)
+        # 可注入的时钟，便于测试返修七天窗口；生产环境默认 UTC 当前时间。
+        self.clock = clock
         self._schema_lock = threading.Lock()
 
     def connect(self) -> sqlite3.Connection:
@@ -61,14 +80,6 @@ class ReviewStore:
                     status TEXT NOT NULL DEFAULT 'submitted'
                         CHECK (status IN ('submitted','under_review','decided','withdrawn')),
                     created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS paper_versions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL REFERENCES papers(id),
-                    version INTEGER NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE (paper_id, version)
                 );
                 CREATE TABLE IF NOT EXISTS conflicts (
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
@@ -105,14 +116,6 @@ class ReviewStore:
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
-                    decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
-                    note TEXT NOT NULL DEFAULT '',
-                    decided_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER,
@@ -124,6 +127,11 @@ class ReviewStore:
                 );
                 """
             )
+            # 表结构由各自的关注点模块维护：版本存档、返修规则。
+            conn.executescript(version_archive.SCHEMA_SQL)
+            version_archive.migrate(conn)
+            conn.executescript(revision_rules.SCHEMA_SQL)
+            revision_rules.migrate_decisions(conn)
 
     def seed(self) -> None:
         self.init_schema()
@@ -160,10 +168,7 @@ class ReviewStore:
         )
 
     def submit_paper(self, user_id: str, title: str, abstract: str) -> dict:
-        title, abstract = title.strip(), abstract.strip()
-        if len(title) < 3 or len(abstract) < 20:
-            raise BusinessError("标题至少 3 字，摘要至少 20 字", 422, "invalid_paper")
-        digest = hashlib.sha256(f"{title}\n{abstract}".encode()).hexdigest()
+        title, abstract = version_archive.validate_manuscript(title, abstract)
         with self.connect() as conn:
             user = self._user(conn, user_id)
             self._require(user, "author")
@@ -172,12 +177,9 @@ class ReviewStore:
                 (user_id, title, abstract, utcnow()),
             )
             paper_id = cur.lastrowid
-            conn.execute(
-                "INSERT INTO paper_versions(paper_id,version,content_hash,created_at) VALUES(?,?,?,?)",
-                (paper_id, 1, digest, utcnow()),
-            )
-            self._audit(conn, paper_id, user_id, "paper.submit", {"version": 1, "sha256": digest})
-            return {"id": paper_id, "status": "submitted", "version": 1, "sha256": digest}
+            snap = self._snapshot_version(conn, paper_id, title, abstract)
+            self._audit(conn, paper_id, user_id, "paper.submit", {"version": snap["version"], "sha256": snap["sha256"]})
+            return {"id": paper_id, "status": "submitted", "version": snap["version"], "sha256": snap["sha256"]}
 
     def _paper_view(self, conn: sqlite3.Connection, paper: sqlite3.Row, viewer: sqlite3.Row) -> dict:
         data = {
@@ -185,6 +187,7 @@ class ReviewStore:
             "title": paper["title"],
             "abstract": paper["abstract"],
             "status": paper["status"],
+            "current_version": self._latest_version_number(conn, paper["id"]),
             "created_at": paper["created_at"],
         }
         if viewer["role"] == "chair" or viewer["id"] == paper["author_id"]:
@@ -367,12 +370,15 @@ class ReviewStore:
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
                 if not paper or paper["status"] not in {"submitted", "under_review"}:
                     raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
+                if self._latest_decision(conn, paper_id):
+                    # 返修后论文重新进入 under_review，改判必须走 redecide。
+                    raise BusinessError("论文已作过决定；返修稿请使用改判接口", 409, "paper_decided")
                 completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
                 if completed < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
                 cur = conn.execute(
-                    "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
-                    (paper_id, decision, note.strip(), chair_id, utcnow()),
+                    "INSERT INTO decisions(paper_id,round,decision,note,decided_by,created_at) VALUES(?,1,?,?,?,?)",
+                    (paper_id, decision, note.strip(), chair_id, self.clock()),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
                 self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
@@ -425,6 +431,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html)
             return
+        if method == "GET" and path == "/revision.html":
+            # 作者返修页面，与主页面分开维护。
+            html = (BASE_DIR / "web" / "revision.html").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
         if method == "GET" and path == "/health":
             return self._send(200, {"ok": True})
         store = self._store()
@@ -457,6 +472,29 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
+            if len(parts) == 4 and parts[3] == "versions" and method == "GET":
+                # 版本存档：初投与各次返修稿均可查，旧版不覆盖。
+                return self._send(200, {"items": store.list_versions(self._user_id(), paper_id)})
+            if len(parts) == 4 and parts[3] == "revision" and method == "POST":
+                data = self._body()
+                return self._send(201, store.submit_revision(
+                    self._user_id(), paper_id,
+                    data.get("title", ""), data.get("abstract", ""), data.get("response", ""),
+                ))
+            if len(parts) == 4 and parts[3] == "revision" and method == "GET":
+                return self._send(200, store.revision_status(self._user_id(), paper_id))
+            if len(parts) == 4 and parts[3] == "revision-reviews" and method == "POST":
+                # 原评审人针对新版提交一份复审意见（原有意见仅留档）。
+                data = self._body()
+                return self._send(201, store.submit_revision_review(
+                    self._user_id(), paper_id, data.get("score"), data.get("text", ""),
+                ))
+            if len(parts) == 4 and parts[3] == "redecide" and method == "POST":
+                # 全部原评审人完成新版意见后，主席改判。
+                data = self._body()
+                return self._send(200, store.redecide(
+                    self._user_id(), paper_id, data.get("decision", ""), data.get("note", ""),
+                ))
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
             assignment_id = int(parts[2])
             data = self._body()
